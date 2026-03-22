@@ -1,6 +1,6 @@
 from collections import defaultdict
-from Chapter2.part4_4.GridWorld import GridWorld
-from Chapter2.part4_4.Agent import Agent
+from Chapter4.part4_4.GridWorld import GridWorld
+from Chapter4.part4_4.Agent import Agent
 
 # 创建环境
 env = GridWorld(4, 3)
