@@ -25,11 +25,16 @@ dqn_agent = DQNAgent(device=device)
 
 # ===== 训练开始前：尝试加载断点 =====
 CHECKPOINT_DIR = "checkpoints"
-RESUME_PATH = "checkpoints/ckpt_ep1200.pth"  # 改成具体路径即可续训，如 "checkpoints/ckpt_ep200.pth"
+RESUME_PATH = "checkpoints/ckpt_ep1000.pth"  # 改成具体路径即可续训，如 "checkpoints/ckpt_ep200.pth"
 
 # ✅ 增加 Buffer 预热阈值
-WARMUP_STEPS = 30000   # 至少收集这么多步才开始训练
-TARGET_SYNC_STEPS = 14000  # 每 10000 步同步目标网络
+WARMUP_STEPS = 10000   # 至少收集这么多步才开始训练
+
+# 确定多少步数同步目标网络
+TARGET_SYNC_STEPS_START = 5000
+TARGET_SYNC_STEPS_MAX = 15000
+TARGET_SYNC_STEPS_EPOCH_STEPS = 10
+TARGET_SYNC_STEPS = TARGET_SYNC_STEPS_START
 
 total_steps = 0
 episodes = 10000
@@ -48,6 +53,8 @@ for episode in range(start_episode, episodes):
     action = None  # 保存上一次动作
     processed_image = None
     loss = 0.0
+    # TARGET_SYNC_STEPS = min(TARGET_SYNC_STEPS_START + TARGET_SYNC_STEPS_EPOCH_STEPS * episode, TARGET_SYNC_STEPS_MAX)
+    TARGET_SYNC_STEPS = 10000
 
     # ✅ 修复⑤：封装一个辅助函数，失分后重新发球
     # Pong 在每次失分后需要再次 FIRE（action=1）才会重新发球
@@ -82,7 +89,9 @@ for episode in range(start_episode, episodes):
         # ✅ 修复④：只有超过预热阈值才开始训练
         if total_steps % 4 == 0:
             # 先把数据加入 buffer（无论是否开始训练）
-            dqn_agent.buffer.add((processed_image, action, clipped_reward, processed_next_image, done))
+            dqn_agent.buffer.add(
+                (processed_image, action, clipped_reward, processed_next_image, done)
+            )
             if total_steps >= WARMUP_STEPS:
                 loss = dqn_agent.update_qnet_from_buffer()
                 if loss is not None:
@@ -110,7 +119,7 @@ for episode in range(start_episode, episodes):
 
     dqn_agent.reward_history.append((episode, float(total_reward)))  # 加 float()
     avg_loss = total_loss / loss_count if loss_count > 0 else 0.0
-    print(f"Episode: {episode:4d} | Reward: {total_reward:6.1f} | "
+    print(f"Episode: {episode:4d} | Reward: {total_reward:6.1f} | TARGET_SYNC_STEPS: {TARGET_SYNC_STEPS} | "
           f"Epsilon: {dqn_agent.epsilon:.4f} | Loss: {avg_loss:.6f} | Steps: {total_steps}")
 
     # 关键：每隔几个 Episode 刷新一次图表，不要每个 Step 都刷，太慢

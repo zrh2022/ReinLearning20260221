@@ -5,8 +5,9 @@ import numpy as np
 from matplotlib import pyplot as plt
 import cv2
 
-from Chapter8.part8_3.Buffer import Buffer
-from Chapter8.part8_3.QNet import QNet
+# from Chapter8.part8_4.Buffer import Buffer
+from Chapter8.part8_4.PrioritizedRelayBuffer import PrioritizedReplayBuffer  # 修改导入
+from Chapter8.part8_4.QNet import QNet
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,7 +26,7 @@ class DQNAgent:
 
         # 修改 epsilon 自衰减
         self.epsilon = 1.0
-        self.epsilon_min = 0.05
+        self.epsilon_min = 0.01
         self.epsilon_decay = 0.995
 
         # 新增：缓存最近 4 帧
@@ -35,11 +36,13 @@ class DQNAgent:
         self.qnet = QNet(input_size=input_size, hidden_size=hidden_size, output_size=action_size).to(device)
         # 目标网络
         self.qnet_target = QNet(input_size=input_size, hidden_size=hidden_size, output_size=action_size).to(device)
-        self.buffer = Buffer(buffer_size=buffer_size, batch_size=batch_size)
+        # self.buffer = Buffer(buffer_size=buffer_size, batch_size=batch_size)
+        # 更换为优先级缓存
+        self.buffer = PrioritizedReplayBuffer(buffer_size=buffer_size, batch_size=batch_size)
 
         # 定义损失函数和优化器
         self.criterion = nn.MSELoss()  # 均方误差损失
-        self.optimizer = optim.Adam(self.qnet.parameters(), lr=1e-4)
+        self.optimizer = optim.Adam(self.qnet.parameters(), lr=5e-5)
 
         # 用于线程间通信
         self.reward_history = []
@@ -70,6 +73,7 @@ class DQNAgent:
 
     def image_pre_process(self, image):
         with torch.no_grad():  # ← 整个预处理不需要梯度，加这个
+            image = image[34:194, :, :]
             image_tensor = torch.tensor(image, dtype=torch.float32, device=self.device)
             # RGB -> Gray
             image_tensor = image_tensor.mean(dim=2, keepdim=True)
@@ -160,33 +164,58 @@ class DQNAgent:
         if len(self.buffer) < self.buffer.batch_size:
             return None
 
-        state, action, reward, next_state, is_done = self.buffer.get_batch()
+        # 获取优先级采样
+        idxs, batch, weights = self.buffer.get_batch()
+        # 检查 batch 中每个元素是否可迭代
+        if any(not isinstance(b, (tuple, list)) for b in batch):
+            return None
 
-        state = state.to(self.device)
-        action = action.to(self.device).unsqueeze(1)
-        reward = reward.to(self.device).unsqueeze(1)
-        next_state = next_state.to(self.device)
-        is_done = is_done.to(self.device).unsqueeze(1).float()
+        state, action, reward, next_state, is_done = zip(*batch)
+        # state, action, reward, next_state, is_done = self.buffer.get_batch()
+
+        # 转换为 Tensor 并移动到 device
+        state = torch.stack(state).to(self.device)
+        action = torch.tensor(action, dtype=torch.long).to(self.device).unsqueeze(1)
+        reward = torch.tensor(reward, dtype=torch.float32).to(self.device).unsqueeze(1)
+        next_state = torch.stack(next_state).to(self.device)
+        is_done = torch.tensor(is_done, dtype=torch.int).to(self.device).unsqueeze(1).float()
 
         with torch.no_grad():
-            qs_next = self.qnet_target(next_state)
+            # Double DQN
+            qs_next_target = self.qnet_target(next_state)
+            qs_next = self.qnet(next_state)
 
             # 筛选有效动作
             valid_actions = [0, 2, 3]
-            qs_next = qs_next[:, valid_actions]
+            qs_next_valid = qs_next[:, valid_actions]
 
-            max_qs_next, _ = torch.max(qs_next, dim=1, keepdim=True)
-            target_value = reward + self.gamma * (1 - is_done) * max_qs_next
+            # 找到最大 Q 值及其对应的动作索引
+            max_qs_next, action_qs_next = torch.max(qs_next_valid, dim=1, keepdim=True)
+
+            # 从目标网络中提取对应动作的 Q 值
+            action_qs_next = torch.tensor([valid_actions[i] for i in action_qs_next[:, 0].tolist()],
+                                          device=qs_next.device).unsqueeze(1)
+            max_qs_next_target = qs_next_target.gather(1, action_qs_next)
+
+            target_value = reward + self.gamma * (1 - is_done) * max_qs_next_target
 
         all_qs = self.qnet(state)
         current_q = all_qs.gather(1, action)
-        loss = F.smooth_l1_loss(current_q, target_value)
+
+        # loss = F.smooth_l1_loss(current_q, target_value)
+        # 优先级经验回放：使用权重调整损失
+        weights = torch.tensor(weights, dtype=torch.float32).to(self.device).unsqueeze(1)
+        loss = (F.smooth_l1_loss(current_q, target_value, reduction='none') * weights).mean()
 
         self.optimizer.zero_grad()  # ✅ 用 optimizer.zero_grad() 而非 qnet.zero_grad()
         loss.backward()
         # ✅ 加梯度裁剪，防止梯度爆炸
         torch.nn.utils.clip_grad_norm_(self.qnet.parameters(), max_norm=10.0)
         self.optimizer.step()
+
+        # 更新优先级
+        errors = (target_value - current_q).abs().cpu().detach().numpy()
+        self.buffer.update_priorities(idxs, errors)
 
         return loss.item()
 
